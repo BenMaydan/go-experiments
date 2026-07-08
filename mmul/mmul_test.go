@@ -127,6 +127,7 @@ var benchSizes = []struct {
 	{"256x256x256", 256, 256, 256},
 	{"512x512x512", 512, 512, 512},
 	{"1024x1024x1024", 1024, 1024, 1024},
+	{"2048x2048x2048", 1024, 1024, 1024},
 }
 
 func BenchmarkSeqMul(b *testing.B) {
@@ -145,12 +146,12 @@ func BenchmarkSeqMul(b *testing.B) {
 
 func BenchmarkParallelMul(b *testing.B) {
 	rng := rand.New(rand.NewSource(1))
-	tileWidths := []int{16, 32, 64, 128}
-	kWidths := []int{2, 4, 8, 16, 32, 64}
+	tileWidths := []int{8, 16, 32, 64, 128}
+	kWidths := []int{8, 16, 32, 64}
 
 	for _, sz := range benchSizes {
-		A := randomRowMajor[int](sz.m, sz.k, rng)
-		B := randomColMajor[int](sz.k, sz.n, rng)
+		A := randomRowMajor[float32](sz.m, sz.k, rng)
+		B := randomColMajor[float32](sz.k, sz.n, rng)
 		for _, tile := range tileWidths {
 			for _, k := range kWidths {
 				name := sz.name + "/tile=" + fmt.Sprint(tile) + "/k=" + fmt.Sprint(k)
