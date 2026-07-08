@@ -16,18 +16,19 @@ func subMatMul[T Number](
 	kTileHeight,
 	goroutineNumber int,
 ) {
+	startRow := goroutineNumber * rowsToProcess
+
 	for _, colTileStart := range tileStarts(m1.Height(), colTileWidth) {
-		startRow := goroutineNumber * rowsToProcess
 		colTileEnd := min(m2.Width(), colTileStart + colTileWidth)
 		for k := 0; k < (m1.Width() + kTileHeight - 1) / kTileHeight; k++ {
 			kStart := k * kTileHeight
 			kEnd := min(kStart + kTileHeight, m1.Width())
 			for row := startRow; row < min(m1.Height(), startRow + rowsToProcess); row++ {
-				v1 := m1.RowSlice(row, kStart, kEnd)
+				partialRow := m1.RowSlice(row, kStart, kEnd)
 				for col := colTileStart; col < colTileEnd; col++ {
 					// now we set out[row, col] = dot(row, col)
-					// we may need to tile further by K since these two vectors probably don't fit in L1 cache
-					out.Acc(row, col, dot(v1, m2.ColSlice(col, kStart, kEnd)))
+					// this is partial so we do an accumulation
+					out.Acc(row, col, dot(partialRow, m2.ColSlice(col, kStart, kEnd)))
 				}
 			}
 		}
