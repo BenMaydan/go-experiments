@@ -4,6 +4,7 @@ import (
 	"math/rand"
 	"testing"
 	"fmt"
+	"runtime"
 )
 
 // --- helpers -----------------------------------------------------------
@@ -72,7 +73,7 @@ func TestParallelMatchesSequential(t *testing.T) {
 			B := randomColMajor[int](sz.k, sz.n, rng)
 
 			want := A.SeqMul(B)
-			got := A.Mul(B, tile, A.Width())
+			got := A.Mul(B, 32, tile, A.Width())
 
 			if !matricesEqual(want, got, 1e-9) {
 				t.Errorf(
@@ -104,7 +105,8 @@ func TestParallelMatchesSequentialKnownValues(t *testing.T) {
 	B.Set(2, 1, 1)
 
 	want := A.SeqMul(B)
-	got := A.Mul(B, 32, A.Width())
+	numGoroutines := min(runtime.GOMAXPROCS(0), A.Height())
+	got := A.Mul(B, numGoroutines, 32, A.Width())
 
 	if !matricesEqual(want, got, 1e-9) {
 		t.Errorf("known-value case mismatch:\nseq:\n%v\npar:\n%v", want, got)
@@ -122,12 +124,11 @@ var benchSizes = []struct {
 	name    string
 	m, k, n int
 }{
-	{"64x64x64", 64, 64, 64},
-	{"128x128x128", 128, 128, 128},
-	{"256x256x256", 256, 256, 256},
-	{"512x512x512", 512, 512, 512},
+	// {"64x64x64", 64, 64, 64},
+	// {"128x128x128", 128, 128, 128},
+	// {"256x256x256", 256, 256, 256},
+	// {"512x512x512", 512, 512, 512},
 	{"1024x1024x1024", 1024, 1024, 1024},
-	{"2048x2048x2048", 1024, 1024, 1024},
 }
 
 func BenchmarkSeqMul(b *testing.B) {
@@ -146,21 +147,24 @@ func BenchmarkSeqMul(b *testing.B) {
 
 func BenchmarkParallelMul(b *testing.B) {
 	rng := rand.New(rand.NewSource(1))
+	numGoroutines := []int{8, 16, 20, 24, 28, 32}
 	tileWidths := []int{8, 16, 32, 64, 128}
-	kWidths := []int{8, 16, 32, 64}
+	kWidths := []int{8, 16, 32, 64, 128, 256}
 
 	for _, sz := range benchSizes {
 		A := randomRowMajor[float32](sz.m, sz.k, rng)
 		B := randomColMajor[float32](sz.k, sz.n, rng)
-		for _, tile := range tileWidths {
-			for _, k := range kWidths {
-				name := sz.name + "/tile=" + fmt.Sprint(tile) + "/k=" + fmt.Sprint(k)
-				b.Run(name, func(b *testing.B) {
-					b.ResetTimer()
-					for i := 0; i < b.N; i++ {
-						_ = A.Mul(B, tile, k)
-					}
-				})
+		for _, numGr := range numGoroutines {
+			for _, tile := range tileWidths {
+				for _, k := range kWidths {
+					name := sz.name + "/numGoroutines=" + fmt.Sprint(numGr) + "/tile=" + fmt.Sprint(tile) + "/k=" + fmt.Sprint(k)
+					b.Run(name, func(b *testing.B) {
+						b.ResetTimer()
+						for i := 0; i < b.N; i++ {
+							_ = A.Mul(B, numGr, tile, k)
+						}
+					})
+				}
 			}
 		}
 	}

@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"runtime"
 	"sync"
 )
 
@@ -36,7 +35,7 @@ func subMatMul[T Number](
 }
 
 
-func (m1 *RowMajorMatrix[T]) Mul(m2 *ColMajorMatrix[T], colTileWidth, kTileHeight int) *RowMajorMatrix[T] {
+func (m1 *RowMajorMatrix[T]) Mul(m2 *ColMajorMatrix[T], numGoroutines, colTileWidth, kTileHeight int) *RowMajorMatrix[T] {
 	// here is the fun part, deciding how to split up the work per goroutine
 	// we will have 32 goroutines for maximal work
 	// how do we split up the dot product / accumulation to maximize reads from the matrix?
@@ -50,7 +49,6 @@ func (m1 *RowMajorMatrix[T]) Mul(m2 *ColMajorMatrix[T], colTileWidth, kTileHeigh
 	out := NewRowMajorMatrix[T](outHeight, outWidth)
 	// out[i, j] = m1[i, :] dot m2[:, j]
 
-	numGoroutines := min(runtime.GOMAXPROCS(0), m1.Height())
 	rowsPerGoroutine := (m1.Height() + numGoroutines - 1) / numGoroutines
 
 	// a tile of output will be 32x32
@@ -115,7 +113,7 @@ func main() {
 	B.Set(2, 1, 1)
 
 	out := A.SeqMul(B)
-	outParallel := A.Mul(B, 32, 32)
+	outParallel := A.Mul(B, 32, 32, 32)
 
 	fmt.Println(A)
 	fmt.Println(B)
