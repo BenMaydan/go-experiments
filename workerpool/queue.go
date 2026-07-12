@@ -38,6 +38,23 @@ func (queue *Queue[T]) Add(elem T) {
 	queue.elements = append([]T{elem}, queue.elements...)
 }
 
+func (queue *Queue[T]) Peek() (elem T, err error) {
+	queue.Lock()
+	defer queue.Unlock()
+
+	// handles empty case
+	if len(queue.elements) == 0 {
+		// is this panic-able?
+		// I don't think so because it signals to the dispatcher to hold in the select statement
+		err = errors.New("cannot peek empty queue")
+		return
+	}
+
+	lastIdx := len(queue.elements) - 1
+	elem = queue.elements[lastIdx]
+	return
+}
+
 func (queue *Queue[T]) Pop() (elem T, err error) {
 	queue.Lock()
 	defer queue.Unlock()
@@ -46,7 +63,7 @@ func (queue *Queue[T]) Pop() (elem T, err error) {
 	if len(queue.elements) == 0 {
 		// is this panic-able?
 		// I don't think so because it signals to the dispatcher to hold in the select statement
-		err = errors.New("queue is empty")
+		err = errors.New("cannot pop empty queue")
 		return
 	}
 

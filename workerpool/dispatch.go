@@ -91,6 +91,7 @@ func (wp *WorkerPool) processWaitingQueue() bool {
 func (wp *WorkerPool) killIdleWorker() bool {
 	select {
 	case wp.assignCh <- nil:
+		wp.numWorkers--
 		return true
 	default:
 		return false
@@ -109,18 +110,20 @@ func (wp *WorkerPool) runQueuedTasks() {
 // important distinction: when the idle timeout fires, at most one worker is killed
 func (wp *WorkerPool) dispatch(idleTimeoutDuration time.Duration) {
 	c := time.After(idleTimeoutDuration)
-	closed := false
-	var job job
+	idle := false
 
+dispatchLoop:
 	for {
-
 		select {
 		case <-c:
-			wp.killIdleWorker()
+			if idle { wp.killIdleWorker() }
 			c = time.After(idleTimeoutDuration)
+			idle = true
 			continue
-		case job, closed = <-wp.submitCh:
-			// try to send a job to an idle worker
+		case job, open := <-wp.submitCh:
+			if !open { break dispatchLoop } // breaks out of select statement
+			idle = false
+			// try to send a job to an idle worker -- only if not closed
 			// a worker needs to be waiting to receive for this to pass
 			// if it does not pass, that means we put the job on the waiting queue
 			select {
@@ -130,15 +133,16 @@ func (wp *WorkerPool) dispatch(idleTimeoutDuration time.Duration) {
 			}
 		}
 
-		if closed { break }
-
 		// for every additional queued job
 		// if num idle workers > 0
 		// 		send job to idle worker
 		// else if num workers < num max workers
 		// 		create new worker and send him off with this queued job
-		for queuedJob := range wp.queueJobs.All() {
-			if wp.numWorkers == wp.maxWorkers { break } // this means we are at worker capacity
+	Drain:
+		for {
+			queuedJob, err := wp.queueJobs.Peek() // don't remove it yet, we don't know if anyone can accept it
+			if err != nil { break }
+
 			// earlier we either killed an idle worker (and moved to next iteration)
 			// or we got a submitted job and assigned or added to the queue
 			// if we are inside this for loop we have queued up jobs, but we don't necessarily have idle workers
@@ -147,11 +151,16 @@ func (wp *WorkerPool) dispatch(idleTimeoutDuration time.Duration) {
 			select {
 			case wp.assignCh <- queuedJob:
 			default:
-				// if we failed that means no workers are idle, so we are forced to create a new worker
+				// if we failed that means no workers are idle, so we are forced to create a new BUSY worker
+				// only if we have space
+				if wp.numWorkers >= wp.maxWorkers { break Drain }
 				wp.wg.Add(1)
 				wp.numWorkers++
 				go worker(queuedJob, wp.assignCh, wp.wg)
 			}
+
+			// a worker (idle or previously working) accepted it so we can remove the queued job
+			wp.queueJobs.Pop()
 		}
 	}
 
