@@ -35,6 +35,7 @@ type WorkerPool struct {
 	maxWorkers uint
 	maxJobQueueSize uint
 	wait bool
+	stopped bool
 
 	// jobs isn't a Queue type because goroutines run in parallel
 	// so there is no meaning to have an ordering of tasks
@@ -54,18 +55,22 @@ func InitWorkerPool(options *WorkerPoolOptions) (*WorkerPool, error) {
 	}
 
 	pool := &WorkerPool{
+		numWorkers: options.NumInitialWorkers,
 		maxWorkers: options.MaxWorkers,
 		maxJobQueueSize: options.MaxJobQueueSize,
-		running: true,
+		wait: false,
+		stopped: false,
+
 		// only the dispatcher touches the receiving end
 		// do, submit, submitwait, pause can all send to it
 		submitCh: make(chan job),
 		// dispatcher is the only sender, any worker can be the receiver
 		assignCh: make(chan job),
+
 		queueJobs: Queue[job]{},
+		wg: &sync.WaitGroup{},
 	}
 
-	pool.wg = &sync.WaitGroup{}
 	pool.wg.Add(int(options.NumInitialWorkers))
 	pool.numWorkers = options.NumInitialWorkers
 	for range options.NumInitialWorkers {

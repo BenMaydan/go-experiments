@@ -56,7 +56,7 @@ func (wp *WorkerPool) StopWait() {
 
 // reports whether the pool has been stopped
 func (wp *WorkerPool) Stopped() bool {
-	return !wp.running
+	return wp.stopped
 }
 
 /*
@@ -79,12 +79,30 @@ func worker(task job, workQueue <-chan job, wg *sync.WaitGroup) {
 
 // internal shared implementation for Stop/StopWait that signals shutdown and waits for the dispatcher to finish
 func (wp *WorkerPool) stop(wait bool) {
-
+	// the dispatch function breaks out of the loop when the submit channel is closed
+	// we need to set wp.wait = wait and close the channel
+	// to avoid a race condition, setting wait is required to be first
+	// 		this is only since the dispatcher runs on a different goroutine
+	wp.stopped = true
+	wp.wait = wait
+	close(wp.submitCh)
 }
 
-// moves one task between the incoming queue, waiting queue, and an available worker
+// moves one task between the submit channel, assign channel, and an available worker.
+// Return: a boolean for whether the pool is still open or not
 func (wp *WorkerPool) processWaitingQueue() bool {
-	return false
+	job, err := wp.queueJobs.Peek()
+	if err != nil { panic("empty queue should not be possible") }
+
+	select {
+	case wp.assignCh <- job:
+		wp.queueJobs.Pop()
+	case incomingJob, status := <-wp.submitCh:
+		if !status { return status }
+		wp.queueJobs.Add(incomingJob)
+	}
+
+	return true
 }
 
 // sends a kill signal to a worker if one is currently idle and ready
@@ -100,7 +118,16 @@ func (wp *WorkerPool) killIdleWorker() bool {
 
 // drains the waiting queue by handing every remaining task to workers before shutdown
 func (wp *WorkerPool) runQueuedTasks() {
+	for {
+		queuedJob, err := wp.queueJobs.Pop()
+		if err != nil { break }
 
+		// critically, someone will always be able to receive this job
+		// not all the workers can be idle and thus have been killed off
+		// 		because that means there wouldn't be any more queued jobs
+		// so if there exists a queued job, there must be at least one worker ready to handle it
+		wp.assignCh <- queuedJob
+	}
 }
 
 // the core loop that
@@ -109,61 +136,49 @@ func (wp *WorkerPool) runQueuedTasks() {
 // 	 manages the waiting queue
 // important distinction: when the idle timeout fires, at most one worker is killed
 func (wp *WorkerPool) dispatch(idleTimeoutDuration time.Duration) {
-	c := time.After(idleTimeoutDuration)
+	timer := time.NewTimer(idleTimeoutDuration)
 	idle := false
 
-dispatchLoop:
+Loop:
 	for {
+		if wp.queueJobs.Size() != 0 {
+			if !wp.processWaitingQueue() { break Loop }
+    		continue
+		}
+
 		select {
-		case <-c:
+		case <-timer.C:
 			if idle { wp.killIdleWorker() }
-			c = time.After(idleTimeoutDuration)
+			timer.Reset(idleTimeoutDuration)
 			idle = true
 			continue
 		case job, open := <-wp.submitCh:
-			if !open { break dispatchLoop } // breaks out of select statement
+			// if the submit channel is closed that means the pool was stopped
+			if !open { break Loop }
 			idle = false
-			// try to send a job to an idle worker -- only if not closed
-			// a worker needs to be waiting to receive for this to pass
-			// if it does not pass, that means we put the job on the waiting queue
+
 			select {
+			// we first attempt a non blocking handoff to any worker
 			case wp.assignCh <- job:
 			default:
-				wp.queueJobs.Add(job)
+				// Has to be true: all available workers are busy
+				if wp.numWorkers < wp.maxWorkers {
+					// if we can spawn a new worker, we do
+					wp.wg.Add(1)
+					wp.numWorkers++
+					go worker(job, wp.assignCh, wp.wg)
+				} else {
+					// It could also be that we are at the maximum number of workers
+					// so we are forced to queue up the job -- this holds the invariant
+					// that a non empty queue means no more workers can be spawned
+					wp.queueJobs.Add(job)
+				}
 			}
-		}
-
-		// for every additional queued job
-		// if num idle workers > 0
-		// 		send job to idle worker
-		// else if num workers < num max workers
-		// 		create new worker and send him off with this queued job
-	Drain:
-		for {
-			queuedJob, err := wp.queueJobs.Peek() // don't remove it yet, we don't know if anyone can accept it
-			if err != nil { break }
-
-			// earlier we either killed an idle worker (and moved to next iteration)
-			// or we got a submitted job and assigned or added to the queue
-			// if we are inside this for loop we have queued up jobs, but we don't necessarily have idle workers
-			// we need a select statement to attempt to send to an idle worker
-			// otherwise we make a new worker and send it that way since we are not at worker capacity
-			select {
-			case wp.assignCh <- queuedJob:
-			default:
-				// if we failed that means no workers are idle, so we are forced to create a new BUSY worker
-				// only if we have space
-				if wp.numWorkers >= wp.maxWorkers { break Drain }
-				wp.wg.Add(1)
-				wp.numWorkers++
-				go worker(queuedJob, wp.assignCh, wp.wg)
-			}
-
-			// a worker (idle or previously working) accepted it so we can remove the queued job
-			wp.queueJobs.Pop()
 		}
 	}
 
+	// when the pool is stopped the wait boolean can be set to true
+	// in which case all remaining tasks will be run before the pool is shut down
 	if wp.wait {
 		wp.runQueuedTasks()
 	}
