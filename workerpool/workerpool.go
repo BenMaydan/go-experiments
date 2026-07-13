@@ -1,9 +1,10 @@
 package workerpool
 
 import (
-	"sync"
-	"time"
 	"errors"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 /*
@@ -17,32 +18,33 @@ Launched goroutines need to be called with the following things:
 
 */
 
-
 type job func()
 
 type WorkerPoolOptions struct {
 	NumInitialWorkers uint // 0 does not "warm-up" any workers
-	MaxWorkers uint
-	IdleTimeout time.Duration
-	MaxJobQueueSize uint // 0 means unbounded job queue size
+	MaxWorkers        uint
+	IdleTimeout       time.Duration
+	MaxJobQueueSize   uint // 0 means unbounded job queue size
 	ErrorHandlingHook func()
 }
 
 // Worker pool cannot be value-copied since it has a mutex inside!!
 // Always pass by reference
 type WorkerPool struct {
-	numWorkers uint
-	maxWorkers uint
+	numWorkers      uint
+	maxWorkers      uint
 	maxJobQueueSize uint
-	wait bool
-	stopped bool
+	abandon         *atomic.Bool
+	stoppedMu       *sync.Mutex
+	stopped         *atomic.Bool
+	shutdownOnce    *sync.Once
 
 	// jobs isn't a Queue type because goroutines run in parallel
 	// so there is no meaning to have an ordering of tasks
-	submitCh chan job
-	assignCh chan job
+	submitCh  chan job
+	assignCh  chan job
 	queueJobs Queue[job]
-	wg *sync.WaitGroup
+	wg        *sync.WaitGroup
 }
 
 // constructs the pool with its channels/config and starts the dispatcher goroutine
@@ -54,12 +56,20 @@ func InitWorkerPool(options *WorkerPoolOptions) (*WorkerPool, error) {
 		return nil, errors.New("num initial workers cannot be greater than max number of workers")
 	}
 
+	// default is false for both
+	var abandon atomic.Bool
+	var stopped atomic.Bool
+	var stopMu sync.Mutex
+	var shutdownOnce sync.Once
+
 	pool := &WorkerPool{
-		numWorkers: options.NumInitialWorkers,
-		maxWorkers: options.MaxWorkers,
+		numWorkers:      options.NumInitialWorkers,
+		maxWorkers:      options.MaxWorkers,
 		maxJobQueueSize: options.MaxJobQueueSize,
-		wait: false,
-		stopped: false,
+		abandon:         &abandon,
+		stoppedMu:       &stopMu,
+		stopped:         &stopped,
+		shutdownOnce:    &shutdownOnce,
 
 		// only the dispatcher touches the receiving end
 		// do, submit, submitwait, pause can all send to it
@@ -68,7 +78,7 @@ func InitWorkerPool(options *WorkerPoolOptions) (*WorkerPool, error) {
 		assignCh: make(chan job),
 
 		queueJobs: Queue[job]{},
-		wg: &sync.WaitGroup{},
+		wg:        &sync.WaitGroup{},
 	}
 
 	pool.wg.Add(int(options.NumInitialWorkers))
@@ -84,7 +94,6 @@ func InitWorkerPool(options *WorkerPoolOptions) (*WorkerPool, error) {
 	return pool, nil
 }
 
-
 // returns the maximum number of concurrent workers
 func (wp *WorkerPool) Size() uint {
 	return wp.maxWorkers
@@ -92,6 +101,5 @@ func (wp *WorkerPool) Size() uint {
 
 // returns the current number of tasks sitting in the waiting queue
 func (wp *WorkerPool) WaitingQueueSize() int {
-	return wp.jobs.Size()
+	return wp.queueJobs.Size()
 }
-

@@ -1,9 +1,10 @@
 package workerpool
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"time"
-	"context"
 )
 
 /*
@@ -24,45 +25,88 @@ The worker function requires a sync.WaitGroup because:
 
 // submits a task, returning an error instead of panicking if the pool is stopped
 func (wp *WorkerPool) Do(task job) error {
+	if wp.stopped.Load() {
+		return errors.New("cannot submit task on stopped pool")
+	}
+	wp.submitCh <- task
 	return nil
 }
 
 // submits a task, panicking if the pool is stopped
 func (wp *WorkerPool) Submit(task job) {
-	if !wp.running {
+	if wp.stopped.Load() {
 		panic("cannot submit task on stopped pool")
 	}
+	wp.submitCh <- task
 }
 
 // submits a task and blocks until that specific task has finished executing
+// When this function returns to the caller, it's guaranteed that the task finished running
 func (wp *WorkerPool) SubmitWait(task job) {
+	if wp.stopped.Load() {
+		panic("cannot submit task on stopped pool")
+	}
 
+	// We achieve this by forcing SubmitWait to wait on a new channel receiving a done signal
+	// the task wraps itself into a wrapper task which sends on c when it's completed
+	// we are required to use defer since the task might panic (and be recovered)
+	c := make(chan struct{})
+	wrapperTask := func() {
+		defer func() { c <- struct{}{} }()
+		task()
+	}
+
+	// what happens if stop is called? it closes submitCh
+	wp.submitCh <- wrapperTask
+	<-c
 }
 
 // blocks all workers from taking new tasks until the given context is done
 func (wp *WorkerPool) Pause(ctx context.Context) {
+	// what should happen if multiple goroutines call pause at the same time??
+	// send to each worker a fake task that blocks until context is done
+	blockingTask := func() { <-ctx.Done() }
 
+	for range wp.maxWorkers {
+		wp.submitCh <- blockingTask
+	}
 }
 
-// stops the pool, abandoning any not-yet-running queued tasks
+// stops the pool but first runs all queued tasks to completion
 func (wp *WorkerPool) Stop() {
 	wp.stop(false)
 }
 
-// stops the pool but first runs all queued tasks to completion
-func (wp *WorkerPool) StopWait() {
+// stops the pool, abandoning any not-yet-running queued tasks
+func (wp *WorkerPool) StopAbandon() {
 	wp.stop(true)
 }
 
 // reports whether the pool has been stopped
 func (wp *WorkerPool) Stopped() bool {
-	return wp.stopped
+	return wp.stopped.Load()
+}
+
+// internal shared implementation for Stop/StopAbandon that signals shutdown and waits for the dispatcher to finish
+func (wp *WorkerPool) stop(abandon bool) {
+	// the dispatch function breaks out of the loop when the submit channel is closed
+	// we need to set wp.wait = wait and close the channel
+	// to avoid a race condition, setting wait is required to be first
+	// 		this is only since the dispatcher runs on a different goroutine
+	wp.stopped.Store(true)
+	wp.abandon.Store(abandon)
+	
+	// we only want to close the channel once
+	wp.shutdownOnce.Do(func() {
+		close(wp.submitCh)
+	})
 }
 
 /*
 runs tasks in a loop until it receives a nil task, then exits
 
 The worker function requires a sync.WaitGroup because:
+
 	the dispatcher — or whoever calls StopWait/Stop — needs a way to know "all worker goroutines have actually exited", and channels alone don't give you that for free.
 	Here's the gap: sending nil down a worker's channel tells that worker "you should exit,"
 	but it doesn't tell you (the caller) when the worker has actually finished exiting.
@@ -77,28 +121,21 @@ func worker(task job, workQueue <-chan job, wg *sync.WaitGroup) {
 	}
 }
 
-// internal shared implementation for Stop/StopWait that signals shutdown and waits for the dispatcher to finish
-func (wp *WorkerPool) stop(wait bool) {
-	// the dispatch function breaks out of the loop when the submit channel is closed
-	// we need to set wp.wait = wait and close the channel
-	// to avoid a race condition, setting wait is required to be first
-	// 		this is only since the dispatcher runs on a different goroutine
-	wp.stopped = true
-	wp.wait = wait
-	close(wp.submitCh)
-}
-
 // moves one task between the submit channel, assign channel, and an available worker.
 // Return: a boolean for whether the pool is still open or not
 func (wp *WorkerPool) processWaitingQueue() bool {
 	job, err := wp.queueJobs.Peek()
-	if err != nil { panic("empty queue should not be possible") }
+	if err != nil {
+		panic("empty queue should not be possible")
+	}
 
 	select {
 	case wp.assignCh <- job:
 		wp.queueJobs.Pop()
 	case incomingJob, status := <-wp.submitCh:
-		if !status { return status }
+		if !status {
+			return status
+		}
 		wp.queueJobs.Add(incomingJob)
 	}
 
@@ -120,7 +157,15 @@ func (wp *WorkerPool) killIdleWorker() bool {
 func (wp *WorkerPool) runQueuedTasks() {
 	for {
 		queuedJob, err := wp.queueJobs.Pop()
-		if err != nil { break }
+		if err != nil {
+			break
+		}
+
+		// to prevent extra side effects from tasks being created
+		// two separate goroutines can call Stop and StopAbandon
+		// StopAbandon has priority so the abandon flag can theoretically
+		// change in between this loop
+		if wp.abandon.Load() { return }
 
 		// critically, someone will always be able to receive this job
 		// not all the workers can be idle and thus have been killed off
@@ -131,9 +176,11 @@ func (wp *WorkerPool) runQueuedTasks() {
 }
 
 // the core loop that
-// 	 routes tasks to workers
-//	 spawns/kills workers
-// 	 manages the waiting queue
+//
+//	routes tasks to workers
+//	spawns/kills workers
+//	manages the waiting queue
+//
 // important distinction: when the idle timeout fires, at most one worker is killed
 func (wp *WorkerPool) dispatch(idleTimeoutDuration time.Duration) {
 	timer := time.NewTimer(idleTimeoutDuration)
@@ -142,19 +189,25 @@ func (wp *WorkerPool) dispatch(idleTimeoutDuration time.Duration) {
 Loop:
 	for {
 		if wp.queueJobs.Size() != 0 {
-			if !wp.processWaitingQueue() { break Loop }
-    		continue
+			if !wp.processWaitingQueue() {
+				break Loop
+			}
+			continue
 		}
 
 		select {
 		case <-timer.C:
-			if idle { wp.killIdleWorker() }
+			if idle {
+				wp.killIdleWorker()
+			}
 			timer.Reset(idleTimeoutDuration)
 			idle = true
 			continue
 		case job, open := <-wp.submitCh:
 			// if the submit channel is closed that means the pool was stopped
-			if !open { break Loop }
+			if !open {
+				break Loop
+			}
 			idle = false
 
 			select {
@@ -179,7 +232,7 @@ Loop:
 
 	// when the pool is stopped the wait boolean can be set to true
 	// in which case all remaining tasks will be run before the pool is shut down
-	if wp.wait {
+	if wp.abandon.Load() {
 		wp.runQueuedTasks()
 	}
 
