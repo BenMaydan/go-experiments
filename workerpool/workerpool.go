@@ -35,9 +35,10 @@ type WorkerPool struct {
 	maxWorkers      uint
 	maxJobQueueSize uint
 	abandon         *atomic.Bool
-	stoppedMu       *sync.Mutex
-	stopped         *atomic.Bool
-	shutdownOnce    *sync.Once
+	stopLock        *sync.Mutex
+	stopped         bool
+
+	stopSignal chan struct{} // SubmitWait and Pause wait on this so they can prematurely exit if pool is stopped
 
 	// jobs isn't a Queue type because goroutines run in parallel
 	// so there is no meaning to have an ordering of tasks
@@ -58,18 +59,17 @@ func InitWorkerPool(options *WorkerPoolOptions) (*WorkerPool, error) {
 
 	// default is false for both
 	var abandon atomic.Bool
-	var stopped atomic.Bool
-	var stopMu sync.Mutex
-	var shutdownOnce sync.Once
+	var stopLock sync.Mutex
 
 	pool := &WorkerPool{
 		numWorkers:      options.NumInitialWorkers,
 		maxWorkers:      options.MaxWorkers,
 		maxJobQueueSize: options.MaxJobQueueSize,
 		abandon:         &abandon,
-		stoppedMu:       &stopMu,
-		stopped:         &stopped,
-		shutdownOnce:    &shutdownOnce,
+		stopLock:        &stopLock,
+		stopped:         false,
+
+		stopSignal: make(chan struct{}),
 
 		// only the dispatcher touches the receiving end
 		// do, submit, submitwait, pause can all send to it

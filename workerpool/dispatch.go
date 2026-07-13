@@ -24,29 +24,30 @@ The worker function requires a sync.WaitGroup because:
 */
 
 // submits a task, returning an error instead of panicking if the pool is stopped
-func (wp *WorkerPool) Do(task job) error {
-	if wp.stopped.Load() {
-		return errors.New("cannot submit task on stopped pool")
-	}
+func (wp *WorkerPool) Do(task job) (err error) {
+	defer func() {
+        if r := recover(); r != nil {
+            err = errors.New("cannot submit task on stopped pool")
+        }
+    }()
+
+	// if this panics (because the pool was stopped), then the deferred function will recover and send an error
 	wp.submitCh <- task
-	return nil
+	
+	return
 }
 
 // submits a task, panicking if the pool is stopped
 func (wp *WorkerPool) Submit(task job) {
-	if wp.stopped.Load() {
-		panic("cannot submit task on stopped pool")
+	err := wp.Do(task)
+	if err != nil {
+		panic(err)
 	}
-	wp.submitCh <- task
 }
 
 // submits a task and blocks until that specific task has finished executing
 // When this function returns to the caller, it's guaranteed that the task finished running
 func (wp *WorkerPool) SubmitWait(task job) {
-	if wp.stopped.Load() {
-		panic("cannot submit task on stopped pool")
-	}
-
 	// We achieve this by forcing SubmitWait to wait on a new channel receiving a done signal
 	// the task wraps itself into a wrapper task which sends on c when it's completed
 	// we are required to use defer since the task might panic (and be recovered)
@@ -57,18 +58,38 @@ func (wp *WorkerPool) SubmitWait(task job) {
 	}
 
 	// what happens if stop is called? it closes submitCh
-	wp.submitCh <- wrapperTask
+	wp.Submit(wrapperTask)
 	<-c
 }
 
-// blocks all workers from taking new tasks until the given context is done
+// blocks all workers from taking new tasks, and does not return until every worker has confirmed it's actually parked waiting on the context.
 func (wp *WorkerPool) Pause(ctx context.Context) {
-	// what should happen if multiple goroutines call pause at the same time??
-	// send to each worker a fake task that blocks until context is done
-	blockingTask := func() { <-ctx.Done() }
+	// to prevent races between two goroutines calling Pause
+	wp.stopLock.Lock()
+	defer wp.stopLock.Unlock()
+
+	// if the pool is already stopped then we cannot pause
+	if wp.stopped { return }
+
+	waitingCh := make(chan struct{})
+	blockingTask := func() {
+		waitingCh <- struct{}{}
+		select {
+		case <-ctx.Done():
+		case <-wp.stopSignal:
+		}
+	}
 
 	for range wp.maxWorkers {
-		wp.submitCh <- blockingTask
+		wp.Submit(blockingTask)
+	}
+
+	// block until all workers are currently waiting (sent their state on the channel)
+	for range wp.maxWorkers {
+		select {
+		case <-waitingCh:
+		case <-wp.stopSignal:
+		}
 	}
 }
 
@@ -84,22 +105,26 @@ func (wp *WorkerPool) StopAbandon() {
 
 // reports whether the pool has been stopped
 func (wp *WorkerPool) Stopped() bool {
-	return wp.stopped.Load()
+	wp.stopLock.Lock()
+	stopped := wp.stopped
+	wp.stopLock.Unlock()
+	return stopped
 }
 
 // internal shared implementation for Stop/StopAbandon that signals shutdown and waits for the dispatcher to finish
 func (wp *WorkerPool) stop(abandon bool) {
-	// the dispatch function breaks out of the loop when the submit channel is closed
-	// we need to set wp.wait = wait and close the channel
-	// to avoid a race condition, setting wait is required to be first
-	// 		this is only since the dispatcher runs on a different goroutine
-	wp.stopped.Store(true)
-	wp.abandon.Store(abandon)
-	
-	// we only want to close the channel once
-	wp.shutdownOnce.Do(func() {
-		close(wp.submitCh)
-	})
+	// this allows goroutines to escalate the abandon flag
+	if abandon { wp.abandon.Store(true) }
+
+	wp.stopLock.Lock()
+	defer wp.stopLock.Unlock()
+
+	// closing the channel only happens once because of this check
+	if wp.stopped { return }
+
+	wp.stopped = true
+	close(wp.stopSignal)
+	close(wp.submitCh)
 }
 
 /*
