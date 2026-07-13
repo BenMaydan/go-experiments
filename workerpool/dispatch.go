@@ -2,32 +2,15 @@ package workerpool
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"time"
 )
-
-/*
-worker(task func(), workerQueue chan func(), wg *sync.WaitGroup) — runs tasks in a loop until it receives a nil task, then exits.
-stop(wait bool) — internal shared implementation for Stop/StopWait that signals shutdown and waits for the dispatcher to finish.
-processWaitingQueue() bool — moves one task between the incoming queue, waiting queue, and an available worker.
-killIdleWorker() bool — sends a kill signal to a worker if one is currently idle and ready.
-runQueuedTasks() — drains the waiting queue by handing every remaining task to workers before shutdown.
-
-
-The worker function requires a sync.WaitGroup because:
-	the dispatcher — or whoever calls StopWait/Stop — needs a way to know "all worker goroutines have actually exited", and channels alone don't give you that for free.
-	Here's the gap: sending nil down a worker's channel tells that worker "you should exit,"
-	but it doesn't tell you (the caller) when the worker has actually finished exiting.
-	The send returns as soon as the worker receives the value — not when the worker goroutine has run its cleanup and returned.
-	If Stop/StopWait returns right after firing off nil to every worker, you have no guarantee the goroutines are actually gone yet; they might still be mid-teardown.
-*/
 
 // submits a task, returning an error instead of panicking if the pool is stopped
 func (wp *WorkerPool) Do(task job) (err error) {
 	defer func() {
         if r := recover(); r != nil {
-            err = errors.New("cannot submit task on stopped pool")
+            err = &ErrorStopped{}
         }
     }()
 
@@ -111,7 +94,7 @@ func (wp *WorkerPool) Stopped() bool {
 	return stopped
 }
 
-// internal shared implementation for Stop/StopAbandon that signals shutdown and waits for the dispatcher to finish
+// internal shared implementation for Stop/StopAbandon that signals shutdown and waits for all workers to finish
 func (wp *WorkerPool) stop(abandon bool) {
 	// this allows goroutines to escalate the abandon flag
 	if abandon { wp.abandon.Store(true) }
@@ -125,6 +108,9 @@ func (wp *WorkerPool) stop(abandon bool) {
 	wp.stopped = true
 	close(wp.stopSignal)
 	close(wp.submitCh)
+
+	// to wait on workers to finish we need to block on the wait group the workers are using
+	wp.wg.Wait()
 }
 
 /*
@@ -132,14 +118,21 @@ runs tasks in a loop until it receives a nil task, then exits
 
 The worker function requires a sync.WaitGroup because:
 
-	the dispatcher — or whoever calls StopWait/Stop — needs a way to know "all worker goroutines have actually exited", and channels alone don't give you that for free.
+	the dispatcher — or whoever calls StopAbandon/Stop — needs a way to know "all worker goroutines have actually exited", and channels alone don't give you that for free.
 	Here's the gap: sending nil down a worker's channel tells that worker "you should exit,"
 	but it doesn't tell you (the caller) when the worker has actually finished exiting.
 	The send returns as soon as the worker receives the value — not when the worker goroutine has run its cleanup and returned.
-	If Stop/StopWait returns right after firing off nil to every worker, you have no guarantee the goroutines are actually gone yet; they might still be mid-teardown.
+	If Stop/StopAbandon returns right after firing off nil to every worker, you have no guarantee the goroutines are actually gone yet; they might still be mid-teardown.
 */
-func worker(task job, workQueue <-chan job, wg *sync.WaitGroup) {
+func worker(task job, workQueue <-chan job, wg *sync.WaitGroup, errHandler func(err any)) {
 	defer wg.Done()
+	// provides user-assisted way to recover from a panicking worker/task
+	defer func() {
+		if r := recover(); r != nil {
+            errHandler(r)
+        }
+	}()
+
 	for task != nil {
 		task()
 		task = <-workQueue
@@ -244,7 +237,7 @@ Loop:
 					// if we can spawn a new worker, we do
 					wp.wg.Add(1)
 					wp.numWorkers++
-					go worker(job, wp.assignCh, wp.wg)
+					go worker(job, wp.assignCh, wp.wg, wp.errHandler)
 				} else {
 					// It could also be that we are at the maximum number of workers
 					// so we are forced to queue up the job -- this holds the invariant
@@ -257,7 +250,7 @@ Loop:
 
 	// when the pool is stopped the wait boolean can be set to true
 	// in which case all remaining tasks will be run before the pool is shut down
-	if wp.abandon.Load() {
+	if !wp.abandon.Load() {
 		wp.runQueuedTasks()
 	}
 

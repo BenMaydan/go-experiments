@@ -18,6 +18,12 @@ Launched goroutines need to be called with the following things:
 
 */
 
+type ErrorStopped struct {}
+
+func (e *ErrorStopped) Error() string {
+	return "cannot run function on stopped pool"
+}
+
 type job func()
 
 type WorkerPoolOptions struct {
@@ -25,7 +31,7 @@ type WorkerPoolOptions struct {
 	MaxWorkers        uint
 	IdleTimeout       time.Duration
 	MaxJobQueueSize   uint // 0 means unbounded job queue size
-	ErrorHandlingHook func()
+	ErrorHandlingHook func(any)
 }
 
 // Worker pool cannot be value-copied since it has a mutex inside!!
@@ -33,7 +39,6 @@ type WorkerPoolOptions struct {
 type WorkerPool struct {
 	numWorkers      uint
 	maxWorkers      uint
-	maxJobQueueSize uint
 	abandon         *atomic.Bool
 	stopLock        *sync.Mutex
 	stopped         bool
@@ -46,6 +51,8 @@ type WorkerPool struct {
 	assignCh  chan job
 	queueJobs Queue[job]
 	wg        *sync.WaitGroup
+
+	errHandler func(any)
 }
 
 // constructs the pool with its channels/config and starts the dispatcher goroutine
@@ -56,6 +63,9 @@ func InitWorkerPool(options *WorkerPoolOptions) (*WorkerPool, error) {
 	if options.NumInitialWorkers > options.MaxWorkers {
 		return nil, errors.New("num initial workers cannot be greater than max number of workers")
 	}
+	if options.ErrorHandlingHook == nil {
+		options.ErrorHandlingHook = func(err any) { panic(err) }
+	}
 
 	// default is false for both
 	var abandon atomic.Bool
@@ -64,7 +74,6 @@ func InitWorkerPool(options *WorkerPoolOptions) (*WorkerPool, error) {
 	pool := &WorkerPool{
 		numWorkers:      options.NumInitialWorkers,
 		maxWorkers:      options.MaxWorkers,
-		maxJobQueueSize: options.MaxJobQueueSize,
 		abandon:         &abandon,
 		stopLock:        &stopLock,
 		stopped:         false,
@@ -79,17 +88,19 @@ func InitWorkerPool(options *WorkerPoolOptions) (*WorkerPool, error) {
 
 		queueJobs: Queue[job]{},
 		wg:        &sync.WaitGroup{},
+
+		errHandler: options.ErrorHandlingHook,
 	}
 
 	pool.wg.Add(int(options.NumInitialWorkers))
 	pool.numWorkers = options.NumInitialWorkers
 	for range options.NumInitialWorkers {
-		go worker(func() {}, pool.assignCh, pool.wg)
+		go worker(func() {}, pool.assignCh, pool.wg, options.ErrorHandlingHook)
 	}
 
 	// start the dispatcher
 	// this is a goroutine that runs the schedule function
-	pool.dispatch(options.IdleTimeout)
+	go pool.dispatch(options.IdleTimeout)
 
 	return pool, nil
 }

@@ -90,6 +90,7 @@ func (queue *Queue[T]) EmptyOut() {
 
 	if len(queue.elements) == 0 { return }
 	clear(queue.elements)
+	queue.elements = queue.elements[:0]
 }
 
 func (queue *Queue[T]) Size() int {
