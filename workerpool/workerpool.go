@@ -44,6 +44,8 @@ type WorkerPool struct {
 	stopped         bool
 
 	stopSignal chan struct{} // SubmitWait and Pause wait on this so they can prematurely exit if pool is stopped
+	finishedAllWork chan struct{} // dispatch sends a signal on this when it knows all workers have completed
+	// stop can block on this channel, it's the only way for a separate goroutine to block on all workers completing
 
 	// jobs isn't a Queue type because goroutines run in parallel
 	// so there is no meaning to have an ordering of tasks
@@ -79,6 +81,7 @@ func InitWorkerPool(options *WorkerPoolOptions) (*WorkerPool, error) {
 		stopped:         false,
 
 		stopSignal: make(chan struct{}),
+		finishedAllWork: make(chan struct{}),
 
 		// only the dispatcher touches the receiving end
 		// do, submit, submitwait, pause can all send to it

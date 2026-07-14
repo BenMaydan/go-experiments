@@ -110,7 +110,7 @@ func (wp *WorkerPool) stop(abandon bool) {
 	close(wp.submitCh)
 
 	// to wait on workers to finish we need to block on the wait group the workers are using
-	wp.wg.Wait()
+	<-wp.finishedAllWork
 }
 
 /*
@@ -201,6 +201,12 @@ func (wp *WorkerPool) runQueuedTasks() {
 //
 // important distinction: when the idle timeout fires, at most one worker is killed
 func (wp *WorkerPool) dispatch(idleTimeoutDuration time.Duration) {
+	// it is safer to defer this
+	// signals to the caller that requested stopping to unblock, it means all workers are done
+	defer func() {
+		wp.finishedAllWork <- struct{}{}
+	}()
+
 	timer := time.NewTimer(idleTimeoutDuration)
 	idle := false
 
@@ -257,4 +263,8 @@ Loop:
 	for range wp.numWorkers {
 		wp.assignCh <- nil
 	}
+
+	// we can be certain no more workers can be added/running so we can wait on the wait group
+	// workers call wg.Done once their for loop breaks, which is when they receive a nil task
+	wp.wg.Wait()
 }
