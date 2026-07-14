@@ -10,7 +10,7 @@ import (
 func (wp *WorkerPool) Do(task job) (err error) {
 	defer func() {
         if r := recover(); r != nil {
-            err = &ErrorStopped{}
+            err = ErrorStopped{}
         }
     }()
 

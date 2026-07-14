@@ -2,11 +2,11 @@ package workerpool
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-	"errors"
 )
 
 // ---------------------------------------------------------------------
@@ -26,8 +26,8 @@ func TestBasicSubmission(t *testing.T) {
 	defer pool.Stop()
 
 	const numTasks = 100
-	var completed int32     // atomic counter: how many tasks actually ran
-	var wg sync.WaitGroup   // lets the test block until all tasks are done
+	var completed int32   // atomic counter: how many tasks actually ran
+	var wg sync.WaitGroup // lets the test block until all tasks are done
 	wg.Add(numTasks)
 
 	for i := 0; i < numTasks; i++ {
@@ -77,7 +77,6 @@ func TestConcurrentStopCalls(t *testing.T) {
 	}
 
 	pool.Submit(task)
-
 
 	// to wait on all callers of Stop to complete
 	n := 14
@@ -160,7 +159,7 @@ func TestConcurrentSubmission(t *testing.T) {
 
 	waitWithTimeout(t, wg, 2*time.Second)
 
-	if completed.Load() != int32(n * m) {
+	if completed.Load() != int32(n*m) {
 		t.FailNow()
 	}
 }
@@ -241,7 +240,6 @@ func TestSubmitWaitBlocksUntilDone(t *testing.T) {
 	}
 	defer pool.Stop()
 
-
 	completed := &atomic.Bool{}
 	duration := 420 * time.Millisecond
 
@@ -283,11 +281,11 @@ func TestDoReturnsErrorAfterStop(t *testing.T) {
 			t.Errorf("calling Do() after Stop() panicked instead of erroring")
 		}
 	}()
-	
+
 	pool.Stop()
 	err = pool.Do(func() {})
 
-	if !errors.Is(err, &ErrorStopped{}) {
+	if !errors.Is(err, ErrorStopped{}) {
 		t.Errorf("calling Do() after Stop() should have returned an ErrorStopped instance")
 	}
 }
@@ -305,14 +303,17 @@ func TestSubmitPanicsAfterStop(t *testing.T) {
 	}
 
 	defer func() {
-		if r := recover(); r != nil {
-			_, ok := r.(ErrorStopped);
+		r := recover()
+		if r == nil {
+			t.Fatal("expected Submit() to panic after Stop(), but it did not")
+		} else {
+			_, ok := r.(ErrorStopped)
 			if !ok {
-				t.Errorf("calling Do() after Submit() should wrap a panic with an instance of ErrorStopped")
+				t.Errorf("calling Do() after Submit() should wrap a panic with an instance of ErrorStopped, instead got %T", r)
 			}
 		}
 	}()
-	
+
 	pool.Stop()
 	pool.Submit(func() {})
 }

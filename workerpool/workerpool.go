@@ -20,7 +20,7 @@ Launched goroutines need to be called with the following things:
 
 type ErrorStopped struct {}
 
-func (e *ErrorStopped) Error() string {
+func (e ErrorStopped) Error() string {
 	return "cannot run function on stopped pool"
 }
 
