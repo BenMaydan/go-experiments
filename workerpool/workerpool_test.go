@@ -2,6 +2,7 @@ package workerpool
 
 import (
 	"context"
+	"go.uber.org/goleak"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -9,10 +10,33 @@ import (
 	"time"
 )
 
-// ---------------------------------------------------------------------
-// WORKED EXAMPLE — study this pattern, you'll reuse it for almost
-// every other test below.
-// ---------------------------------------------------------------------
+// waitWithTimeout turns "test hangs forever on deadlock" into
+// "test fails after N with a clear message" — principle #5 above.
+func waitWithTimeout(t *testing.T, wg *sync.WaitGroup, timeout time.Duration) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for tasks to complete — possible deadlock")
+	}
+}
+
+func eventually(t *testing.T, cond func() bool, timeout, tick time.Duration) {
+    t.Helper()
+    deadline := time.Now().Add(timeout)
+    for time.Now().Before(deadline) {
+        if cond() {
+            return
+        }
+        time.Sleep(tick)
+    }
+    t.Fatal("condition not met within timeout")
+}
 
 // TestBasicSubmission verifies every submitted task actually runs exactly once.
 func TestBasicSubmission(t *testing.T) {
@@ -70,21 +94,24 @@ func TestConcurrentStopCalls(t *testing.T) {
 		t.Fatalf("InitWorkerPool failed: %v", err)
 	}
 
-	completed := &atomic.Bool{}
-	task := func() {
-		time.Sleep(3 * time.Second)
-		completed.Store(true)
-	}
-
-	pool.Submit(task)
-
 	// to wait on all callers of Stop to complete
-	n := 14
+	n := 3
+	taskBlockWg := &sync.WaitGroup{}
+	taskBlockWg.Add(n)
 	wg := &sync.WaitGroup{}
 	wg.Add(n)
 
+	completed := &atomic.Bool{}
+	task := func() {
+		taskBlockWg.Wait()
+		time.Sleep(200 * time.Millisecond)
+		completed.Store(true)
+	}
+
 	concurrentCaller := func(goroutineNumber int) {
 		defer wg.Done()
+		// now let task wait on all stoppers to be in the same place before continuing
+		taskBlockWg.Done()
 		pool.Stop()
 
 		if !completed.Load() {
@@ -92,33 +119,13 @@ func TestConcurrentStopCalls(t *testing.T) {
 		}
 	}
 
+	pool.Submit(task)
 	for i := range n {
 		go concurrentCaller(i)
 	}
 
 	wg.Wait()
 }
-
-// waitWithTimeout turns "test hangs forever on deadlock" into
-// "test fails after N with a clear message" — principle #5 above.
-func waitWithTimeout(t *testing.T, wg *sync.WaitGroup, timeout time.Duration) {
-	t.Helper()
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(timeout):
-		t.Fatal("timed out waiting for tasks to complete — possible deadlock")
-	}
-}
-
-// ---------------------------------------------------------------------
-// YOUR TURN — stubs below. Each has a hint and a self-check question.
-// Delete t.Skip() once implemented.
-// ---------------------------------------------------------------------
 
 // TestConcurrentSubmission: many goroutines calling Submit at once.
 // Hint: launch N goroutines, each submitting M tasks, use the same
@@ -210,15 +217,15 @@ func TestMaxWorkersNeverExceeded(t *testing.T) {
 	waitWithTimeout(t, wg, 2*time.Second)
 
 	if maxSeen > int(pool.maxWorkers) {
-		t.Errorf("Max seen goroutines: {%v} is greater than allowable {%v} goroutines", maxSeen, pool.maxWorkers)
+		t.Fatalf("Max seen goroutines: {%v} is greater than allowable {%v} goroutines", maxSeen, pool.maxWorkers)
 	}
 
 	if int(completed.Load()) != n {
-		t.Errorf("Submitted %v goroutines but only %v completed", n, completed.Load())
+		t.Fatalf("Submitted %v goroutines but only %v completed", n, completed.Load())
 	}
 
 	if current.Load() != 0 {
-		t.Errorf("%v goroutines should have finished but there is/are still %v running", n, current.Load())
+		t.Fatalf("%v goroutines should have finished but there is/are still %v running", n, current.Load())
 	}
 }
 
@@ -255,11 +262,11 @@ func TestSubmitWaitBlocksUntilDone(t *testing.T) {
 	// we assert that enough time has passed and the flag is true
 	// we don't use a wait group but SubmitWait should wait for us
 	if elapsed < duration {
-		t.Errorf("submit wait should have returned after %v time but instead returned after %v time", duration, elapsed)
+		t.Fatalf("submit wait should have returned after %v time but instead returned after %v time", duration, elapsed)
 	}
 
 	if !completed.Load() {
-		t.Errorf("submit wait returned before the task marked the completed flag as true")
+		t.Fatalf("submit wait returned before the task marked the completed flag as true")
 	}
 }
 
@@ -278,7 +285,7 @@ func TestDoReturnsErrorAfterStop(t *testing.T) {
 
 	defer func() {
 		if r := recover(); r != nil {
-			t.Errorf("calling Do() after Stop() panicked instead of erroring")
+			t.Fatalf("calling Do() after Stop() panicked instead of erroring")
 		}
 	}()
 
@@ -286,7 +293,7 @@ func TestDoReturnsErrorAfterStop(t *testing.T) {
 	err = pool.Do(func() {})
 
 	if !errors.Is(err, ErrorStopped{}) {
-		t.Errorf("calling Do() after Stop() should have returned an ErrorStopped instance")
+		t.Fatalf("calling Do() after Stop() should have returned an ErrorStopped instance")
 	}
 }
 
@@ -309,7 +316,7 @@ func TestSubmitPanicsAfterStop(t *testing.T) {
 		} else {
 			_, ok := r.(ErrorStopped)
 			if !ok {
-				t.Errorf("calling Do() after Submit() should wrap a panic with an instance of ErrorStopped, instead got %T", r)
+				t.Fatalf("calling Do() after Submit() should wrap a panic with an instance of ErrorStopped, instead got %T", r)
 			}
 		}
 	}()
@@ -349,7 +356,7 @@ func TestStopRunsQueuedTasks(t *testing.T) {
 
 	pool.Stop()
 	if !completed.Load() {
-		t.Errorf("stopping pool after submitting tasks did not let queued task run to completion")
+		t.Fatalf("stopping pool after submitting tasks did not let queued task run to completion")
 	}
 }
 
@@ -391,10 +398,10 @@ func TestStopAbandonSkipsQueuedTasks(t *testing.T) {
 	// replacing StopAbandon with Stop fails the test so clearly waiting on <-pool.stopSignal works
 	pool.StopAbandon()
 	if !shouldComplete.Load() {
-		t.Error("the task that should have been unqueued and completed did not complete")
+		t.Fatal("the task that should have been unqueued and completed did not complete")
 	}
 	if shouldNotComplete.Load() {
-		t.Error("a queued task ran when it shouldn't have")
+		t.Fatal("a queued task ran when it shouldn't have")
 	}
 }
 
@@ -406,41 +413,135 @@ func TestStopAbandonSkipsQueuedTasks(t *testing.T) {
 // enough for the second goroutine to call StopAbandon() before it
 // finishes — e.g. queue many slow tasks and only Add 1 initial worker.
 func TestStopEscalation(t *testing.T) {
-	t.Skip("TODO")
+	pool, err := InitWorkerPool(&WorkerPoolOptions{
+		MaxWorkers:  1,
+		IdleTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("InitWorkerPool failed: %v", err)
+	}
+
+	// we will have three tasks, all three are submitted after the other
+	// the first task runs and calls Stop on the pool
+	//		it unfortunately needs to sleep for a minimum amount of time
+	//		this is just to make sure the second two tasks are queued
+	//		it's not possible to be certain they are queued with channels
+	// the second task (is queued) runs and adds one to queuedTasksCompleted
+	//		importantly, it calls StopAbandon, which should hopefully prevent task three from ever running if abandon really abandons
+	// the third task (is queued) adds one to queuedTasksCompleted
+
+	queuedTasksCompleted := &atomic.Int32{}
+	stopCompleted := make(chan struct{})
+	
+	taskStopper := func() {
+		time.Sleep(1 * time.Second)
+		// test that there are two queued tasks, otherwise rest of test doesn't make sense
+		if pool.queueJobs.Size() != 2 {
+			t.Fatalf("instead of 2 tasks being queued, only %v are", pool.queueJobs.Size())
+		}
+		go func() {
+			pool.Stop()
+			stopCompleted <- struct{}{}
+		}()
+	}
+	taskQueuedOne := func() {
+		queuedTasksCompleted.Add(1)
+		pool.StopAbandon()
+	}
+	taskQueuedTwo := func() {
+		queuedTasksCompleted.Add(1)
+	}
+
+	pool.Submit(taskStopper)
+	pool.Submit(taskQueuedOne)
+	pool.Submit(taskQueuedTwo)
+
+	// wait until the stopper task completed
+	<-stopCompleted
+
+	if queuedTasksCompleted.Load() != 1 {
+		t.Fatalf("%v queued tasks completed when only 1 should have completed", queuedTasksCompleted.Load())
+	}
 }
 
-// TestPauseBlocksNewTasks: while Pause(ctx) is in effect, no new tasks
-// should start executing; after ctx is cancelled, they should resume.
-// Hint: submit a task, assert (with a timeout, not a sleep-and-hope)
-// that it has NOT run while paused, then cancel the context and assert
-// it now runs.
+// TestPauseBlocksNewTasks: after Pause(ctx) returns, the pool guarantees
+// all workers are already in the paused state — that's your sync point,
+// not a sleep. Submit a task AFTER Pause returns, then prove it doesn't
+// run within some bounded window. Cancel ctx, then prove it does run.
+// Use a channel the task closes/sends on, and select against time.After
+// for both the "shouldn't happen yet" and "should happen now" checks.
 func TestPauseBlocksNewTasks(t *testing.T) {
-	t.Skip("TODO")
+	pool, err := InitWorkerPool(&WorkerPoolOptions{
+		MaxWorkers:  1,
+		IdleTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("InitWorkerPool failed: %v", err)
+	}
+
+
+	completed := &atomic.Int32{}
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	pool.Pause(cancelCtx)
+
+	ran := make(chan struct{})
+	pool.Submit(func() { completed.Add(1); close(ran) })
+
+	// Deterministic-ish: confirm it's parked in the queue, not dispatched.
+	eventually(t, func() bool {
+		return pool.WaitingQueueSize() == 1
+	}, 100*time.Millisecond, time.Millisecond)
+
+	// Now confirm it stays there / hasn't run — this part is still an absence
+	// claim, but now backed up by the queue-size fact above rather than being
+	// the only evidence.
+	select {
+	case <-ran:
+		t.Fatal("task ran while pool was paused")
+	default:
+	}
+
+	cancel()
+	<-ran
+
+	if completed.Load() != 1 {
+		t.Fatal("queued task had context cancelled but did not run")
+	}
 }
 
-// TestPanicRecoveryCallsErrHandler: a panicking task should not crash
-// the pool or kill the worker permanently — it should invoke the
-// configured ErrorHandlingHook and the worker should keep processing
-// subsequent tasks.
-// Hint: set ErrorHandlingHook to a func that records the panic value
-// via a channel or atomic flag instead of the default (which panics).
-// Submit a panicking task, then submit a normal task afterward and
-// confirm it still runs.
-func TestPanicRecoveryCallsErrHandler(t *testing.T) {
-	t.Skip("TODO")
+// test no goroutines leak after every test
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
 }
 
 // TestNoGoroutineLeaks: after Stop(), no worker/dispatcher goroutines
 // should remain running.
-// Hint: this needs go.uber.org/goleak (`go get go.uber.org/goleak`).
-// Pattern:
-//
-//	func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }
-//
 // Then every test that creates a pool must fully Stop() it before
 // returning, or this will fail at the end of the whole test binary run.
 func TestNoGoroutineLeaks(t *testing.T) {
-	t.Skip("TODO — requires goleak dependency")
+	pool, err := InitWorkerPool(&WorkerPoolOptions{
+		MaxWorkers:  32,
+		IdleTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("InitWorkerPool failed: %v", err)
+	}
+
+	completed := &atomic.Int32{}
+
+	n := 1000
+	for range n {
+		pool.Submit(func() {
+			time.Sleep(50 * time.Millisecond)
+			completed.Add(1)
+		})
+	}
+
+	pool.Stop()
+
+	if completed.Load() != int32(n) {
+		t.Fatalf("%v completed instead of the required %v", completed.Load(), n)
+	}
 }
 
 // ---------------------------------------------------------------------

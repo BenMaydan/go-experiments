@@ -32,7 +32,7 @@ func (wp *WorkerPool) Submit(task job) {
 func (wp *WorkerPool) SubmitWait(task job) {
 	// We achieve this by forcing SubmitWait to wait on a new channel receiving a done signal
 	// the task wraps itself into a wrapper task which sends on c when it's completed
-	// we are required to use defer since the task might panic (and be recovered)
+	// we are required to use defer since the task might internally panic (and be recovered)
 	c := make(chan struct{})
 	wrapperTask := func() {
 		defer func() { c <- struct{}{} }()
@@ -47,11 +47,7 @@ func (wp *WorkerPool) SubmitWait(task job) {
 // blocks all workers from taking new tasks, and does not return until every worker has confirmed it's actually parked waiting on the context.
 func (wp *WorkerPool) Pause(ctx context.Context) {
 	// to prevent races between two goroutines calling Pause
-	wp.stopLock.Lock()
-	defer wp.stopLock.Unlock()
-
-	// if the pool is already stopped then we cannot pause
-	if wp.stopped {
+	if wp.Stopped() {
 		return
 	}
 
@@ -82,7 +78,7 @@ func (wp *WorkerPool) StopAbandon() {
 	wp.stop(true)
 }
 
-// reports whether the pool has been stopped
+// reports whether the pool has been stopped.
 func (wp *WorkerPool) Stopped() bool {
 	wp.stopLock.Lock()
 	defer wp.stopLock.Unlock()
@@ -97,17 +93,14 @@ func (wp *WorkerPool) stop(abandon bool) {
 	}
 
 	wp.stopLock.Lock()
-	defer wp.stopLock.Unlock()
-
-	// closing the channel only happens once because of this check
-	if wp.stopped {
-		return
+	if !wp.stopped {
+		wp.stopped = true
+		// send a request to the dispatcher to stop the pool
+		wp.stopRequest <- struct{}{}
 	}
+	wp.stopLock.Unlock()
 
-	wp.stopped = true
-	wp.stopRequest <- struct{}{}
-
-	// to wait on workers to finish we need to block on the wait group the workers are using
+	// wait on workers to finish
 	<-wp.finishedAllWork
 }
 
@@ -122,14 +115,8 @@ The worker function requires a sync.WaitGroup because:
 	The send returns as soon as the worker receives the value — not when the worker goroutine has run its cleanup and returned.
 	If Stop/StopAbandon returns right after firing off nil to every worker, you have no guarantee the goroutines are actually gone yet; they might still be mid-teardown.
 */
-func worker(task job, workQueue <-chan job, wg *sync.WaitGroup, errHandler func(err any)) {
+func worker(task job, workQueue <-chan job, wg *sync.WaitGroup) {
 	defer wg.Done()
-	// provides user-assisted way to recover from a panicking worker/task
-	defer func() {
-		if r := recover(); r != nil {
-			errHandler(r)
-		}
-	}()
 
 	for task != nil {
 		task()
@@ -205,9 +192,7 @@ func (wp *WorkerPool) runQueuedTasks() {
 func (wp *WorkerPool) dispatch(idleTimeoutDuration time.Duration) {
 	// it is safer to defer this
 	// signals to the caller that requested stopping to unblock, it means all workers are done
-	defer func() {
-		wp.finishedAllWork <- struct{}{}
-	}()
+	defer close(wp.finishedAllWork)
 
 	timer := time.NewTimer(idleTimeoutDuration)
 	idle := false
@@ -243,7 +228,7 @@ Loop:
 					// if we can spawn a new worker, we do
 					wp.wg.Add(1)
 					wp.numWorkers++
-					go worker(job, wp.assignCh, wp.wg, wp.errHandler)
+					go worker(job, wp.assignCh, wp.wg)
 				} else {
 					// It could also be that we are at the maximum number of workers
 					// so we are forced to queue up the job -- this holds the invariant

@@ -31,7 +31,6 @@ type WorkerPoolOptions struct {
 	MaxWorkers        uint
 	IdleTimeout       time.Duration
 	MaxJobQueueSize   uint // 0 means unbounded job queue size
-	ErrorHandlingHook func(any)
 }
 
 // Worker pool cannot be value-copied since it has a mutex inside!!
@@ -54,8 +53,6 @@ type WorkerPool struct {
 	assignCh  chan job
 	queueJobs Queue[job]
 	wg        *sync.WaitGroup
-
-	errHandler func(any)
 }
 
 // constructs the pool with its channels/config and starts the dispatcher goroutine
@@ -66,19 +63,12 @@ func InitWorkerPool(options *WorkerPoolOptions) (*WorkerPool, error) {
 	if options.NumInitialWorkers > options.MaxWorkers {
 		return nil, errors.New("num initial workers cannot be greater than max number of workers")
 	}
-	if options.ErrorHandlingHook == nil {
-		options.ErrorHandlingHook = func(err any) { panic(err) }
-	}
-
-	// default is false for both
-	var abandon atomic.Bool
-	var stopLock sync.Mutex
 
 	pool := &WorkerPool{
 		numWorkers:      options.NumInitialWorkers,
 		maxWorkers:      options.MaxWorkers,
-		abandon:         &abandon,
-		stopLock:        &stopLock,
+		abandon:         &atomic.Bool{}, // default is false, that's correct
+		stopLock:        &sync.Mutex{},
 		stopped:         false,
 
 		stopSignal: make(chan struct{}),
@@ -93,14 +83,12 @@ func InitWorkerPool(options *WorkerPoolOptions) (*WorkerPool, error) {
 
 		queueJobs: Queue[job]{},
 		wg:        &sync.WaitGroup{},
-
-		errHandler: options.ErrorHandlingHook,
 	}
 
 	pool.wg.Add(int(options.NumInitialWorkers))
 	pool.numWorkers = options.NumInitialWorkers
 	for range options.NumInitialWorkers {
-		go worker(func() {}, pool.assignCh, pool.wg, options.ErrorHandlingHook)
+		go worker(func() {}, pool.assignCh, pool.wg)
 	}
 
 	// start the dispatcher
