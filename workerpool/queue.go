@@ -19,17 +19,6 @@ type Queue[T any] struct {
 	elements []T
 }
 
-func (queue *Queue[T]) All() iter.Seq[T] {
-	return func(yield func(T) bool) {
-		for _, item := range queue.elements {
-			// Pass the item to the loop. Stop if yield returns false.
-			if !yield(item) {
-				return
-			}
-		}
-	}
-}
-
 func (queue *Queue[T]) Add(elem T) {
 	queue.Lock()
 	defer queue.Unlock()

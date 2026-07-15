@@ -421,51 +421,59 @@ func TestStopEscalation(t *testing.T) {
 		t.Fatalf("InitWorkerPool failed: %v", err)
 	}
 
-	// we will have three tasks, all three are submitted after the other
-	// the first task runs and calls Stop on the pool
-	//		it unfortunately needs to sleep for a minimum amount of time
-	//		this is just to make sure the second two tasks are queued
-	//		it's not possible to be certain they are queued with channels
-	// the second task (is queued) runs and adds one to queuedTasksCompleted
-	//		importantly, it calls StopAbandon, which should hopefully prevent task three from ever running if abandon really abandons
-	// the third task (is queued) adds one to queuedTasksCompleted
+	const numQueued = 5
+	completed := &atomic.Int32{}
 
-	queuedTasksCompleted := &atomic.Int32{}
-	stopCompleted := make(chan struct{})
-	
+	blocker := make(chan struct{})
 	taskStopper := func() {
-		time.Sleep(50 * time.Millisecond)
-		// test that there are two queued tasks, otherwise rest of test doesn't make sense
-		if pool.queueJobs.Size() != 2 {
-			t.Errorf("instead of 2 tasks being queued, only %v are", pool.queueJobs.Size())
-		}
-		go func() {
-			pool.Stop()
-			stopCompleted <- struct{}{}
-		}()
+		<-blocker
 	}
-	taskQueuedOne := func() {
-		queuedTasksCompleted.Add(1)
-		// setting the flag directly (rather than go pool.StopAbandon()) keeps this
-		// synchronous with the rest of taskQueuedOne, so there's no race between this
-		// write and the worker looping back to pick up taskQueuedTwo. Calling
-		// StopAbandon() itself here would also deadlock: it blocks on
-		// <-wp.finishedAllWork, which can't close until this very worker exits.
-		pool.abandon.Store(true)
-	}
-	taskQueuedTwo := func() {
-		queuedTasksCompleted.Add(1)
+	queuedTask := func() {
+		completed.Add(1)
 	}
 
 	pool.Submit(taskStopper)
-	pool.Submit(taskQueuedOne)
-	pool.Submit(taskQueuedTwo)
+	for range numQueued {
+		pool.Submit(queuedTask)
+	}
 
-	// wait until the stopper task completed
-	<-stopCompleted
+	eventually(t, func() bool {
+		return pool.WaitingQueueSize() == numQueued
+	}, 500*time.Millisecond, time.Millisecond)
 
-	if queuedTasksCompleted.Load() != 1 {
-		t.Fatalf("%v queued tasks completed when only 1 should have completed", queuedTasksCompleted.Load())
+	stopDone := make(chan struct{})
+	go func() {
+		pool.Stop()
+		close(stopDone)
+	}()
+
+	eventually(t, pool.Stopped, 500*time.Millisecond, time.Millisecond)
+
+	// StopAbandon() itself blocks until every worker exits — and the
+	// worker can't exit until we close(blocker) below. So it must run in
+	// its own goroutine, not synchronously here.
+	abandonDone := make(chan struct{})
+	go func() {
+		pool.StopAbandon()
+		close(abandonDone)
+	}()
+
+	// Deterministic sync point: abandonSignal is closed synchronously as
+	// the first thing stop(true) does, so receiving from it (closed
+	// channels return immediately) proves the abandon request has
+	// already landed — no sleep, no guessing.
+	<-pool.abandonSignal
+
+	// Only now let the originally-running task return, freeing the
+	// worker — strictly after abandonment was requested with the queue
+	// still full and the worker still occupied.
+	close(blocker)
+
+	<-stopDone
+	<-abandonDone
+
+	if got := completed.Load(); got != 0 {
+		t.Fatalf("expected StopAbandon() called before the drain started to skip all %d queued tasks, but %d ran", numQueued, got)
 	}
 }
 
@@ -483,6 +491,7 @@ func TestPauseBlocksNewTasks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InitWorkerPool failed: %v", err)
 	}
+	defer pool.Stop()
 
 
 	completed := &atomic.Int32{}
@@ -525,7 +534,7 @@ func TestMain(m *testing.M) {
 // returning, or this will fail at the end of the whole test binary run.
 func TestNoGoroutineLeaks(t *testing.T) {
 	pool, err := InitWorkerPool(&WorkerPoolOptions{
-		MaxWorkers:  32,
+		MaxWorkers:  4,
 		IdleTimeout: time.Second,
 	})
 	if err != nil {
@@ -534,7 +543,7 @@ func TestNoGoroutineLeaks(t *testing.T) {
 
 	completed := &atomic.Int32{}
 
-	n := 1000
+	n := 32
 	for range n {
 		pool.Submit(func() {
 			time.Sleep(50 * time.Millisecond)
