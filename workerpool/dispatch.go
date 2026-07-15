@@ -100,7 +100,8 @@ func (wp *WorkerPool) stop(abandon bool) {
 	}
 	wp.stopLock.Unlock()
 
-	// wait on workers to finish
+	// it's important to make the distinction that this only waits on currently running work to complete
+	// not queued tasks. so both Stop and StopAbandon need to wait here.
 	<-wp.finishedAllWork
 }
 

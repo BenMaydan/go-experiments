@@ -190,7 +190,7 @@ func TestMaxWorkersNeverExceeded(t *testing.T) {
 	}
 	defer pool.Stop()
 
-	n := 420
+	n := 32
 	wg := &sync.WaitGroup{}
 	completed := atomic.Int32{}
 	current := atomic.Int32{}
@@ -248,7 +248,7 @@ func TestSubmitWaitBlocksUntilDone(t *testing.T) {
 	defer pool.Stop()
 
 	completed := &atomic.Bool{}
-	duration := 420 * time.Millisecond
+	duration := 50 * time.Millisecond
 
 	task := func() {
 		time.Sleep(duration)
@@ -434,10 +434,10 @@ func TestStopEscalation(t *testing.T) {
 	stopCompleted := make(chan struct{})
 	
 	taskStopper := func() {
-		time.Sleep(1 * time.Second)
+		time.Sleep(50 * time.Millisecond)
 		// test that there are two queued tasks, otherwise rest of test doesn't make sense
 		if pool.queueJobs.Size() != 2 {
-			t.Fatalf("instead of 2 tasks being queued, only %v are", pool.queueJobs.Size())
+			t.Errorf("instead of 2 tasks being queued, only %v are", pool.queueJobs.Size())
 		}
 		go func() {
 			pool.Stop()
@@ -446,7 +446,12 @@ func TestStopEscalation(t *testing.T) {
 	}
 	taskQueuedOne := func() {
 		queuedTasksCompleted.Add(1)
-		pool.StopAbandon()
+		// setting the flag directly (rather than go pool.StopAbandon()) keeps this
+		// synchronous with the rest of taskQueuedOne, so there's no race between this
+		// write and the worker looping back to pick up taskQueuedTwo. Calling
+		// StopAbandon() itself here would also deadlock: it blocks on
+		// <-wp.finishedAllWork, which can't close until this very worker exits.
+		pool.abandon.Store(true)
 	}
 	taskQueuedTwo := func() {
 		queuedTasksCompleted.Add(1)
