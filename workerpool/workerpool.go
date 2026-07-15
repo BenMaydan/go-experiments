@@ -44,6 +44,7 @@ type WorkerPool struct {
 	stopped         bool
 
 	stopSignal chan struct{} // SubmitWait and Pause wait on this so they can prematurely exit if pool is stopped
+	stopRequest chan struct{} // stop() sends here; dispatch alone acks it and closes stopSignal
 	finishedAllWork chan struct{} // dispatch sends a signal on this when it knows all workers have completed
 	// stop can block on this channel, it's the only way for a separate goroutine to block on all workers completing
 
@@ -81,6 +82,7 @@ func InitWorkerPool(options *WorkerPoolOptions) (*WorkerPool, error) {
 		stopped:         false,
 
 		stopSignal: make(chan struct{}),
+		stopRequest: make(chan struct{}),
 		finishedAllWork: make(chan struct{}),
 
 		// only the dispatcher touches the receiving end

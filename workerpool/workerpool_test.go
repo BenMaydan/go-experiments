@@ -324,7 +324,33 @@ func TestSubmitPanicsAfterStop(t *testing.T) {
 // each take a moment, so some are guaranteed to still be queued when
 // Stop() is called from another goroutine. Assert all of them ran.
 func TestStopRunsQueuedTasks(t *testing.T) {
-	t.Skip("TODO")
+	pool, err := InitWorkerPool(&WorkerPoolOptions{
+		MaxWorkers:  1,
+		IdleTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("InitWorkerPool failed: %v", err)
+	}
+
+	completed := atomic.Bool{}
+
+	// we run two tasks, one that waits on the pool to stop (forcing the second to stay queued)
+	// and a second task which sets completed to true
+	// this way only if completed is true then we know that queued tasks ran after calling Stop()
+	blockingTask := func() {
+		<-pool.stopSignal
+	}
+	nonBlockingTask := func() {
+		completed.Store(true)
+	}
+	
+	pool.Submit(blockingTask)
+	pool.Submit(nonBlockingTask)
+
+	pool.Stop()
+	if !completed.Load() {
+		t.Errorf("stopping pool after submitting tasks did not let queued task run to completion")
+	}
 }
 
 // TestStopAbandonSkipsQueuedTasks: StopAbandon() must NOT run tasks that
@@ -336,7 +362,40 @@ func TestStopRunsQueuedTasks(t *testing.T) {
 // case rather than getting lucky? (Think: block workers deliberately so
 // tasks are forced to queue.)
 func TestStopAbandonSkipsQueuedTasks(t *testing.T) {
-	t.Skip("TODO")
+	pool, err := InitWorkerPool(&WorkerPoolOptions{
+		MaxWorkers:  1,
+		IdleTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("InitWorkerPool failed: %v", err)
+	}
+
+	// can I reliably reproduce behavior with only two tasks?
+	// one task I want to force to run, and one should somehow remain on the queue
+	//		the caveat is the one that is forced to run should run AT LEAST until the caller calls StopAbandon
+	shouldComplete := &atomic.Bool{}
+	shouldNotComplete := &atomic.Bool{}
+	taskToComplete := func() {
+		shouldComplete.Store(true)
+		// the last thing that happens after stopSignal is closed in the internal stop function is that it waits for all the workers to complete
+		// so if this task blocks on receiving from stopSignal (which immediately unblocks when the channel is closed), that forces the second
+		// worker to only start once we know that we have started to abandon tasks
+		<-pool.stopSignal
+	}
+	taskToNotComplete := func() {
+		shouldNotComplete.Store(true)
+	}
+	pool.Submit(taskToComplete)
+	pool.Submit(taskToNotComplete)
+
+	// replacing StopAbandon with Stop fails the test so clearly waiting on <-pool.stopSignal works
+	pool.StopAbandon()
+	if !shouldComplete.Load() {
+		t.Error("the task that should have been unqueued and completed did not complete")
+	}
+	if shouldNotComplete.Load() {
+		t.Error("a queued task ran when it shouldn't have")
+	}
 }
 
 // TestStopEscalation: per docs.md, if Stop() is in progress and another
