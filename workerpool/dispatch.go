@@ -89,7 +89,7 @@ func (wp *WorkerPool) Stopped() bool {
 func (wp *WorkerPool) stop(abandon bool) {
 	// this allows goroutines to escalate the abandon flag
 	if abandon {
-		wp.abandon.Store(true)
+		wp.escalateAbandon()
 	}
 
 	wp.stopLock.Lock()
@@ -103,6 +103,16 @@ func (wp *WorkerPool) stop(abandon bool) {
 	// it's important to make the distinction that this only waits on currently running work to complete
 	// not queued tasks. so both Stop and StopAbandon need to wait here.
 	<-wp.finishedAllWork
+}
+
+// escalateAbandon idempotently signals that queued-but-not-running tasks
+// should be dropped. Safe to call from any goroutine, including synchronously
+// from within a task the pool itself is currently running — unlike
+// StopAbandon, it never blocks.
+func (wp *WorkerPool) escalateAbandon() {
+	wp.abandonOnce.Do(func() {
+		close(wp.abandonSignal)
+	})
 }
 
 /*
@@ -167,19 +177,21 @@ func (wp *WorkerPool) runQueuedTasks() {
 			break
 		}
 
-		// to prevent extra side effects from tasks being created
-		// two separate goroutines can call Stop and StopAbandon
-		// StopAbandon has priority so the abandon flag can theoretically
-		// change in between this loop
-		if wp.abandon.Load() {
+		// Racing the handoff against abandonSignal rather than checking a
+		// flag once and then committing to an uninterruptible send means
+		// abandonment can still cancel a job that's already parked here
+		// waiting for a worker.
+		// I can only minimally prioritize abandoning but there is still a (by design) unfixable race condition
+		select {
+		case <-wp.abandonSignal:
 			return
+		default:
+			select {
+			case wp.assignCh <- queuedJob:
+			case <-wp.abandonSignal:
+				return
+			}
 		}
-
-		// critically, someone will always be able to receive this job
-		// not all the workers can be idle and thus have been killed off
-		// 		because that means there wouldn't be any more queued jobs
-		// so if there exists a queued job, there must be at least one worker ready to handle it
-		wp.assignCh <- queuedJob
 	}
 }
 
@@ -248,11 +260,7 @@ Loop:
 		close(wp.stopSignal)
 	}
 
-	// when the pool is stopped the wait boolean can be set to true
-	// in which case all remaining tasks will be run before the pool is shut down
-	if !wp.abandon.Load() {
-		wp.runQueuedTasks()
-	}
+	wp.runQueuedTasks()
 
 	for range wp.numWorkers {
 		wp.assignCh <- nil

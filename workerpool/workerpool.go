@@ -3,7 +3,6 @@ package workerpool
 import (
 	"errors"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -36,14 +35,15 @@ type WorkerPoolOptions struct {
 // Worker pool cannot be value-copied since it has a mutex inside!!
 // Always pass by reference
 type WorkerPool struct {
-	numWorkers      uint
-	maxWorkers      uint
-	abandon         *atomic.Bool
-	stopLock        *sync.Mutex
-	stopped         bool
+	numWorkers    uint
+	maxWorkers    uint
+	abandonSignal chan struct{}
+	abandonOnce   *sync.Once
+	stopLock      *sync.Mutex
+	stopped       bool
 
-	stopSignal chan struct{} // SubmitWait and Pause wait on this so they can prematurely exit if pool is stopped
-	stopRequest chan struct{} // stop() sends here; dispatch alone acks it and closes stopSignal
+	stopSignal      chan struct{} // SubmitWait and Pause wait on this so they can prematurely exit if pool is stopped
+	stopRequest     chan struct{} // stop() sends here; dispatch alone acks it and closes stopSignal
 	finishedAllWork chan struct{} // dispatch sends a signal on this when it knows all workers have completed
 	// stop can block on this channel, it's the only way for a separate goroutine to block on all workers completing
 
@@ -65,11 +65,15 @@ func InitWorkerPool(options *WorkerPoolOptions) (*WorkerPool, error) {
 	}
 
 	pool := &WorkerPool{
-		numWorkers:      options.NumInitialWorkers,
-		maxWorkers:      options.MaxWorkers,
-		abandon:         &atomic.Bool{}, // default is false, that's correct
-		stopLock:        &sync.Mutex{},
-		stopped:         false,
+		numWorkers: options.NumInitialWorkers,
+		maxWorkers: options.MaxWorkers,
+
+		// this needs to be a signal to allow escalation of StopAbandon when running queued tasks after the pool has stopped
+		// otherwise the dispatcher can block on sending a task (which at that point even if the abandon flag had been sent in time, will force the task to run)
+		abandonSignal: make(chan struct{}),
+		abandonOnce:   &sync.Once{}, // abandon signal is closed exactly once, when queued-but-not-running tasks should be dropped
+		stopLock:      &sync.Mutex{},
+		stopped:       false,
 
 		stopSignal: make(chan struct{}),
 		stopRequest: make(chan struct{}),
