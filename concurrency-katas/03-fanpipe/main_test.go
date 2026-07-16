@@ -28,22 +28,34 @@ func TestGenerateCancelStopsSend(t *testing.T) {
 func TestWorkerCancelStopsSend(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	in := make(chan int) // unbuffered, we control delivery by hand
+	in := make(chan int)
 	results := worker(ctx, in)
 
-	// This send only returns once worker's select has actually picked
-	// "case v, ok := <-in:" — so after this line, we know worker has
-	// the value and is now computing isPrime, about to block trying
-	// to send the result to a channel nobody's reading.
 	in <- 4
-
 	cancel()
 
-	// If worker ignored ctx.Done() on the result-send, this blocks
-	// forever and -timeout kills the test.
-	_, ok := <-results
-	if ok {
-		t.Fatal("expected results to be closed after cancel")
+	// worker's send-select races ctx.Done() against results<-, both of
+	// which become ready the instant we start receiving. Go's select
+	// resolves ties uniformly at random, so either outcome is valid:
+	//   - ctx.Done() wins: we see closure immediately
+	//   - the send wins: we see the in-flight value, then closure next
+	select {
+	case v, ok := <-results:
+		if !ok {
+			return // closed immediately, ctx.Done() won
+		}
+		t.Logf("in-flight value delivered before close: %v", v)
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not respond after cancel")
+	}
+
+	select {
+	case _, ok := <-results:
+		if ok {
+			t.Fatal("expected results closed on second receive")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not close results after in-flight value")
 	}
 }
 
